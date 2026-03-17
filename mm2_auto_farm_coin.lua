@@ -1,40 +1,41 @@
 --[[
     ╔══════════════════════════════════════════════╗
-    ║   MM2 Auto Farm Coin Script                  ║
+    ║   MM2 Auto Farm Coin Script v5.0             ║
     ║   Game: Murder Mystery 2 (Roblox)            ║
-    ║   Cấu trúc: Workspace → Map → CoinContainer ║
+    ║   Phương pháp: Bay đến coin (RenderStepped)  ║
     ╚══════════════════════════════════════════════╝
     
     Cấu trúc game MM2:
     game.Workspace
-    └── [MapName]                  -- Map được load mỗi round
-        └── CoinContainer          -- Folder chứa coins
-            ├── Coin_Server        -- Mỗi coin instance
-            │   └── CoinVisual     -- Part hiển thị (dùng để teleport)
-            ├── Coin_Server
-            │   └── CoinVisual
+    └── [MapName]
+        └── CoinContainer
+            ├── Coin_Server → CoinVisual
             └── ...
+    
+    Player bay mượt đến coin bằng CFrame Lerp + RenderStepped.
+    Tắt trọng lực bằng BodyVelocity.
+    Noclip giúp bay xuyên tường đến coin.
 ]]
 
 -- ═══════════════════════════════════════════
 -- CẤU HÌNH
 -- ═══════════════════════════════════════════
 local Config = {
-    -- Farm
-    FarmEnabled       = false,        -- Bắt đầu tắt, bấm nút UI để bật
-    FarmDelay         = 0.05,         -- Delay giữa mỗi lần teleport coin (giây)
-    ReScanDelay       = 1,            -- Delay khi không tìm thấy coin (chờ spawn)
-    TeleportYOffset   = 2,            -- Offset Y khi teleport (tránh kẹt dưới đất)
+    FarmEnabled       = false,
     
-    -- Safe Mode (Tween teleport mượt thay vì instant)
-    SafeMode          = false,        -- true = tween, false = instant teleport
-    TweenSpeed        = 0.08,         -- Thời gian tween (giây), chỉ khi SafeMode = true
+    -- Tốc độ bay (LOCKED = 25 studs/giây)
+    FlySpeed          = 25,           -- Tốc độ bay cố định 25 studs/giây
     
-    -- Anti-AFK
-    AntiAFK           = true,         -- Chống bị kick AFK
+    -- Delays
+    CoinDelay         = 1            -- Delay sau khi nhặt mỗi coin (đợi 2s trước khi tele tiếp)
+    SweepDelay        = 1.5,          -- Delay sau mỗi lượt quét
+    ReScanDelay       = 2,            -- Delay khi không tìm thấy coin
     
-    -- UI
-    ShowNotifications = true,         -- Hiển thị thông báo game
+    -- Noclip (bay xuyên tường)
+    Noclip            = true,         -- Bật noclip khi farm
+    
+    AntiAFK           = true,
+    ShowNotifications = true,
 }
 
 -- ═══════════════════════════════════════════
@@ -43,7 +44,6 @@ local Config = {
 local Players           = game:GetService("Players")
 local Workspace         = game:GetService("Workspace")
 local RunService        = game:GetService("RunService")
-local TweenService      = game:GetService("TweenService")
 local VirtualUser       = game:GetService("VirtualUser")
 local StarterGui        = game:GetService("StarterGui")
 local UserInputService  = game:GetService("UserInputService")
@@ -57,12 +57,12 @@ local Camera      = Workspace.CurrentCamera
 local totalCoinsCollected = 0
 local currentMapName      = nil
 local isRunning           = false
+local noclipConnection    = nil
 
 -- ═══════════════════════════════════════════
 -- UTILITIES
 -- ═══════════════════════════════════════════
 
---- Gửi notification trong game
 local function Notify(title, text, duration)
     if not Config.ShowNotifications then return end
     pcall(function()
@@ -74,59 +74,87 @@ local function Notify(title, text, duration)
     end)
 end
 
---- Lấy HumanoidRootPart
 local function GetRoot()
     local char = LocalPlayer.Character
     return char and char:FindFirstChild("HumanoidRootPart")
 end
 
---- Lấy Humanoid
 local function GetHumanoid()
     local char = LocalPlayer.Character
     return char and char:FindFirstChildOfClass("Humanoid")
 end
 
---- Teleport đến vị trí (hỗ trợ SafeMode)
-local function TeleportTo(targetCFrame)
+-- ═══════════════════════════════════════════
+-- NOCLIP (bay xuyên tường)
+-- ═══════════════════════════════════════════
+
+local function EnableNoclip()
+    if noclipConnection then return end
+    noclipConnection = RunService.Stepped:Connect(function()
+        pcall(function()
+            local char = LocalPlayer.Character
+            if not char then return end
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = false
+                end
+            end
+        end)
+    end)
+end
+
+local function DisableNoclip()
+    if noclipConnection then
+        noclipConnection:Disconnect()
+        noclipConnection = nil
+    end
+    -- Khôi phục collision
+    pcall(function()
+        local char = LocalPlayer.Character
+        if not char then return end
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+                part.CanCollide = true
+            end
+        end
+    end)
+end
+
+-- ═══════════════════════════════════════════
+-- TELEPORT TO COIN (Dịch chuyển tức thời)
+-- ═══════════════════════════════════════════
+
+local function TeleportToCoin(targetPosition)
     local root = GetRoot()
     if not root then return false end
     
-    if Config.SafeMode then
-        local tween = TweenService:Create(root, TweenInfo.new(Config.TweenSpeed, Enum.EasingStyle.Linear), {
-            CFrame = targetCFrame
-        })
-        tween:Play()
-        tween.Completed:Wait()
-    else
-        root.CFrame = targetCFrame
-    end
+    -- Teleport tức thời đến vị trí coin
+    -- Dùng CFrame + nhích lên 1 chút xíu trục Y để chống kẹt mặt đất
+    root.CFrame = CFrame.new(targetPosition + Vector3.new(0, 1, 0))
+    
     return true
 end
 
---- Fire touch interest để trigger thu thập coin
-local function TouchPart(part)
+--- Touch coin để thu thập
+local function TouchCoin(coinPart)
     local root = GetRoot()
-    if not root or not part then return end
+    if not root or not coinPart then return end
     pcall(function()
         if firetouchinterest then
-            firetouchinterest(root, part, 0) -- Touch bắt đầu
+            firetouchinterest(root, coinPart, 0)
             task.wait()
-            firetouchinterest(root, part, 1) -- Touch kết thúc
+            firetouchinterest(root, coinPart, 1)
         end
     end)
 end
 
 -- ═══════════════════════════════════════════
 -- MAP DETECTION
--- Tìm map hiện tại trong Workspace bằng cách
--- tìm child nào có "CoinContainer" bên trong
 -- ═══════════════════════════════════════════
 
---- Tìm map hiện tại đang active trong Workspace
 local function FindCurrentMap()
     for _, child in ipairs(Workspace:GetChildren()) do
-        -- Map là một Model hoặc Folder chứa CoinContainer
-        if (child:IsA("Model") or child:IsA("Folder")) then
+        if child:IsA("Model") or child:IsA("Folder") then
             local coinContainer = child:FindFirstChild("CoinContainer")
             if coinContainer then
                 return child, coinContainer
@@ -134,7 +162,6 @@ local function FindCurrentMap()
         end
     end
     
-    -- Fallback: tìm sâu hơn trong Workspace
     for _, child in ipairs(Workspace:GetChildren()) do
         if child:IsA("Model") or child:IsA("Folder") then
             for _, grandchild in ipairs(child:GetChildren()) do
@@ -150,49 +177,37 @@ end
 
 -- ═══════════════════════════════════════════
 -- COIN DETECTION
--- Lấy tất cả coins từ CoinContainer
--- Cấu trúc: CoinContainer → Coin_Server → CoinVisual
 -- ═══════════════════════════════════════════
 
---- Lấy danh sách tất cả coins có thể collect
 local function GetCoins(coinContainer)
     if not coinContainer then return {} end
     
     local coins = {}
     
     for _, coinObj in ipairs(coinContainer:GetChildren()) do
-        -- Mỗi coin thường là "Coin_Server" chứa "CoinVisual"
         if coinObj.Name == "Coin_Server" or coinObj.Name:find("Coin") then
-            -- Tìm CoinVisual bên trong (part mà player cần chạm)
             local coinVisual = coinObj:FindFirstChild("CoinVisual")
             if coinVisual and coinVisual:IsA("BasePart") then
                 table.insert(coins, {
-                    Object = coinObj,
                     Visual = coinVisual,
                     Position = coinVisual.Position,
                 })
             else
-                -- Fallback: nếu không có CoinVisual, tìm BasePart đầu tiên
                 local part = coinObj:FindFirstChildWhichIsA("BasePart")
                 if part then
                     table.insert(coins, {
-                        Object = coinObj,
                         Visual = part,
                         Position = part.Position,
                     })
                 elseif coinObj:IsA("BasePart") then
-                    -- Coin chính là BasePart
                     table.insert(coins, {
-                        Object = coinObj,
                         Visual = coinObj,
                         Position = coinObj.Position,
                     })
                 end
             end
         elseif coinObj:IsA("BasePart") then
-            -- Trường hợp coin là BasePart trực tiếp trong CoinContainer
             table.insert(coins, {
-                Object = coinObj,
                 Visual = coinObj,
                 Position = coinObj.Position,
             })
@@ -202,8 +217,7 @@ local function GetCoins(coinContainer)
     return coins
 end
 
---- Sắp xếp coins theo khoảng cách gần nhất so với player
-local function SortCoinsByDistance(coins)
+local function SortByDistance(coins)
     local root = GetRoot()
     if not root then return coins end
     
@@ -211,101 +225,88 @@ local function SortCoinsByDistance(coins)
     table.sort(coins, function(a, b)
         return (a.Position - rootPos).Magnitude < (b.Position - rootPos).Magnitude
     end)
-    
     return coins
 end
 
 -- ═══════════════════════════════════════════
 -- MAIN FARM LOOP
+-- Player BAY đến từng coin, dừng lại nhặt
 -- ═══════════════════════════════════════════
 
 local function FarmLoop()
     if isRunning then return end
     isRunning = true
     
-    Notify("🪙 MM2 Auto Farm", "Bắt đầu farm coin...")
+    -- Bật noclip
+    if Config.Noclip then
+        EnableNoclip()
+    end
+    
+    Notify("🪙 Auto Farm", "Đang bay đến coins...")
     
     spawn(function()
         while Config.FarmEnabled and isRunning do
             local success, err = pcall(function()
-                -- 1) Đợi character tồn tại
                 if not GetRoot() then
                     if LocalPlayer.Character then
                         task.wait(1)
                     else
                         LocalPlayer.CharacterAdded:Wait()
-                        task.wait(2) -- đợi character load đầy đủ
+                        task.wait(2)
+                        if Config.Noclip then EnableNoclip() end
                     end
-                    return -- retry vòng lặp tiếp
+                    return
                 end
                 
-                -- 2) Tìm map hiện tại
                 local mapModel, coinContainer = FindCurrentMap()
                 
                 if not mapModel or not coinContainer then
-                    -- Chưa có map (đang lobby/intermission) → chờ
                     task.wait(Config.ReScanDelay)
                     return
                 end
                 
-                -- Cập nhật tên map nếu đổi
                 if mapModel.Name ~= currentMapName then
                     currentMapName = mapModel.Name
-                    Notify("🗺️ Map", "Đã detect map: " .. currentMapName)
+                    Notify("🗺️ Map", currentMapName)
                 end
                 
-                -- 3) Lấy tất cả coins trong CoinContainer
                 local coins = GetCoins(coinContainer)
                 
                 if #coins == 0 then
-                    -- Không còn coin → chờ spawn mới
                     task.wait(Config.ReScanDelay)
                     return
                 end
                 
-                -- 4) Sắp xếp theo khoảng cách gần nhất
-                coins = SortCoinsByDistance(coins)
+                coins = SortByDistance(coins)
                 
-                -- 5) Teleport đến từng coin
                 for _, coinData in ipairs(coins) do
                     if not Config.FarmEnabled or not isRunning then break end
                     
-                    -- Kiểm tra coin vẫn tồn tại (chưa bị collect)
                     if coinData.Visual and coinData.Visual.Parent then
-                        local targetPos = coinData.Position
-                        local targetCFrame = CFrame.new(
-                            targetPos.X,
-                            targetPos.Y + Config.TeleportYOffset,
-                            targetPos.Z
-                        )
-                        
                         -- Teleport đến coin
-                        local moved = TeleportTo(targetCFrame)
+                        local reached = TeleportToCoin(coinData.Position)
                         
-                        if moved then
-                            -- Trigger touch để thu thập
-                            TouchPart(coinData.Visual)
-                            
-                            -- Thử touch cả Object cha nếu khác Visual
-                            if coinData.Object ~= coinData.Visual and coinData.Object:IsA("BasePart") then
-                                TouchPart(coinData.Object)
-                            end
-                            
+                        if reached then
+                            TouchCoin(coinData.Visual)
                             totalCoinsCollected = totalCoinsCollected + 1
                         end
                         
-                        task.wait(Config.FarmDelay)
+                        task.wait(Config.CoinDelay)
                     end
                 end
+                
+                task.wait(Config.SweepDelay)
             end)
             
             if not success then
                 warn("[MM2 AutoFarm] Error: " .. tostring(err))
             end
             
-            task.wait(Config.FarmDelay)
+            task.wait(0.3)
         end
         
+        -- Tắt noclip khi dừng
+        DisableNoclip()
         isRunning = false
     end)
 end
@@ -313,7 +314,8 @@ end
 local function StopFarm()
     Config.FarmEnabled = false
     isRunning = false
-    Notify("⛔ MM2 Auto Farm", "Đã dừng. Tổng coins: " .. totalCoinsCollected)
+    DisableNoclip()
+    Notify("⛔ Dừng Farm", "Tổng coins: " .. totalCoinsCollected)
 end
 
 -- ═══════════════════════════════════════════
@@ -332,7 +334,6 @@ end
 -- UI
 -- ═══════════════════════════════════════════
 local function CreateUI()
-    -- Xóa UI cũ
     pcall(function()
         local old = LocalPlayer.PlayerGui:FindFirstChild("MM2FarmUI")
         if old then old:Destroy() end
@@ -343,16 +344,15 @@ local function CreateUI()
     gui.ResetOnSpawn = false
     gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     
-    -- Protect GUI khỏi bị xóa
     pcall(function()
         if syn and syn.protect_gui then syn.protect_gui(gui) end
     end)
     
-    -- ── Main Frame ──
+    -- Main Frame
     local frame = Instance.new("Frame")
     frame.Name = "Main"
-    frame.Size = UDim2.new(0, 230, 0, 200)
-    frame.Position = UDim2.new(0, 10, 0.5, -100)
+    frame.Size = UDim2.new(0, 240, 0, 195)
+    frame.Position = UDim2.new(0, 10, 0.5, -97)
     frame.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
     frame.BackgroundTransparency = 0.05
     frame.BorderSizePixel = 0
@@ -365,7 +365,7 @@ local function CreateUI()
     stroke.Thickness = 2
     stroke.Transparency = 0.3
     
-    -- ── Title Bar ──
+    -- Title Bar
     local titleBar = Instance.new("Frame")
     titleBar.Name = "TitleBar"
     titleBar.Size = UDim2.new(1, 0, 0, 36)
@@ -375,7 +375,6 @@ local function CreateUI()
     
     Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 12)
     
-    -- Fix bo tròn phía dưới title
     local titleFix = Instance.new("Frame")
     titleFix.Size = UDim2.new(1, 0, 0, 14)
     titleFix.Position = UDim2.new(0, 0, 1, -14)
@@ -386,13 +385,13 @@ local function CreateUI()
     local titleLabel = Instance.new("TextLabel")
     titleLabel.Size = UDim2.new(1, 0, 1, 0)
     titleLabel.BackgroundTransparency = 1
-    titleLabel.Text = "🪙 MM2 Auto Farm"
+    titleLabel.Text = "🪙 MM2 Auto Farm v5"
     titleLabel.TextColor3 = Color3.fromRGB(20, 20, 30)
     titleLabel.TextSize = 15
     titleLabel.Font = Enum.Font.GothamBlack
     titleLabel.Parent = titleBar
     
-    -- ── Toggle Farm Button ──
+    -- Toggle Farm Button
     local toggleBtn = Instance.new("TextButton")
     toggleBtn.Name = "ToggleFarm"
     toggleBtn.Size = UDim2.new(0.88, 0, 0, 36)
@@ -406,25 +405,25 @@ local function CreateUI()
     toggleBtn.Parent = frame
     Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 8)
     
-    -- ── Safe Mode Button ──
-    local safeBtn = Instance.new("TextButton")
-    safeBtn.Name = "SafeMode"
-    safeBtn.Size = UDim2.new(0.88, 0, 0, 30)
-    safeBtn.Position = UDim2.new(0.06, 0, 0, 90)
-    safeBtn.BackgroundColor3 = Config.SafeMode and Color3.fromRGB(52, 152, 219) or Color3.fromRGB(80, 80, 90)
-    safeBtn.BorderSizePixel = 0
-    safeBtn.Text = "🛡️ Safe Mode: " .. (Config.SafeMode and "ON" or "OFF")
-    safeBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
-    safeBtn.TextSize = 12
-    safeBtn.Font = Enum.Font.GothamSemibold
-    safeBtn.Parent = frame
-    Instance.new("UICorner", safeBtn).CornerRadius = UDim.new(0, 8)
+    -- Noclip Toggle
+    local noclipBtn = Instance.new("TextButton")
+    noclipBtn.Name = "NoclipBtn"
+    noclipBtn.Size = UDim2.new(0.88, 0, 0, 26)
+    noclipBtn.Position = UDim2.new(0.06, 0, 0, 90)
+    noclipBtn.BackgroundColor3 = Config.Noclip and Color3.fromRGB(52, 152, 219) or Color3.fromRGB(80, 80, 90)
+    noclipBtn.BorderSizePixel = 0
+    noclipBtn.Text = "👻 Noclip: " .. (Config.Noclip and "ON" or "OFF")
+    noclipBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+    noclipBtn.TextSize = 11
+    noclipBtn.Font = Enum.Font.GothamSemibold
+    noclipBtn.Parent = frame
+    Instance.new("UICorner", noclipBtn).CornerRadius = UDim.new(0, 8)
     
-    -- ── Info Labels ──
+    -- Info Labels
     local mapLabel = Instance.new("TextLabel")
     mapLabel.Name = "MapLabel"
     mapLabel.Size = UDim2.new(0.88, 0, 0, 20)
-    mapLabel.Position = UDim2.new(0.06, 0, 0, 130)
+    mapLabel.Position = UDim2.new(0.06, 0, 0, 124)
     mapLabel.BackgroundTransparency = 1
     mapLabel.Text = "🗺️ Map: Đang tìm..."
     mapLabel.TextColor3 = Color3.fromRGB(180, 180, 190)
@@ -436,9 +435,9 @@ local function CreateUI()
     local statusLabel = Instance.new("TextLabel")
     statusLabel.Name = "StatusLabel"
     statusLabel.Size = UDim2.new(0.88, 0, 0, 20)
-    statusLabel.Position = UDim2.new(0.06, 0, 0, 150)
+    statusLabel.Position = UDim2.new(0.06, 0, 0, 144)
     statusLabel.BackgroundTransparency = 1
-    statusLabel.Text = "⏸️ Trạng thái: Chờ bật..."
+    statusLabel.Text = "⏸️ Chờ bật..."
     statusLabel.TextColor3 = Color3.fromRGB(180, 180, 190)
     statusLabel.TextSize = 11
     statusLabel.Font = Enum.Font.Gotham
@@ -448,7 +447,7 @@ local function CreateUI()
     local coinLabel = Instance.new("TextLabel")
     coinLabel.Name = "CoinLabel"
     coinLabel.Size = UDim2.new(0.88, 0, 0, 22)
-    coinLabel.Position = UDim2.new(0.06, 0, 0, 172)
+    coinLabel.Position = UDim2.new(0.06, 0, 0, 166)
     coinLabel.BackgroundTransparency = 1
     coinLabel.Text = "🪙 Coins: 0"
     coinLabel.TextColor3 = Color3.fromRGB(255, 215, 0)
@@ -457,7 +456,7 @@ local function CreateUI()
     coinLabel.TextXAlignment = Enum.TextXAlignment.Left
     coinLabel.Parent = frame
     
-    -- ── Draggable ──
+    -- Draggable
     local dragging, dragInput, dragStart, startPos
     
     titleBar.InputBegan:Connect(function(input)
@@ -491,7 +490,7 @@ local function CreateUI()
         end
     end)
     
-    -- ── Button Events ──
+    -- Button Events
     toggleBtn.MouseButton1Click:Connect(function()
         if isRunning then
             StopFarm()
@@ -505,38 +504,39 @@ local function CreateUI()
         end
     end)
     
-    safeBtn.MouseButton1Click:Connect(function()
-        Config.SafeMode = not Config.SafeMode
-        safeBtn.Text = "🛡️ Safe Mode: " .. (Config.SafeMode and "ON" or "OFF")
-        safeBtn.BackgroundColor3 = Config.SafeMode and Color3.fromRGB(52, 152, 219) or Color3.fromRGB(80, 80, 90)
-        Notify("🛡️ Safe Mode", Config.SafeMode and "Bật - Tween teleport" or "Tắt - Instant teleport")
+    noclipBtn.MouseButton1Click:Connect(function()
+        Config.Noclip = not Config.Noclip
+        noclipBtn.Text = "👻 Noclip: " .. (Config.Noclip and "ON" or "OFF")
+        noclipBtn.BackgroundColor3 = Config.Noclip and Color3.fromRGB(52, 152, 219) or Color3.fromRGB(80, 80, 90)
+        if Config.Noclip and isRunning then
+            EnableNoclip()
+        else
+            DisableNoclip()
+        end
     end)
     
-    -- ── Update Loop (cập nhật UI) ──
+    -- Update Loop
     spawn(function()
         while task.wait(0.5) do
             pcall(function()
-                -- Cập nhật coin counter
                 coinLabel.Text = "🪙 Coins: " .. totalCoinsCollected
                 
-                -- Cập nhật map name
                 local mapModel, coinContainer = FindCurrentMap()
                 if mapModel then
                     mapLabel.Text = "🗺️ Map: " .. mapModel.Name
-                    
                     if isRunning then
                         local coins = GetCoins(coinContainer)
-                        statusLabel.Text = "🔄 Farming... (" .. #coins .. " coins trên map)"
+                        statusLabel.Text = "⚡ Teleport farm... (" .. #coins .. " coins)"
                     end
                 else
-                    mapLabel.Text = "🗺️ Map: Lobby / Chờ round..."
+                    mapLabel.Text = "🗺️ Lobby / Chờ round..."
                     if isRunning then
                         statusLabel.Text = "⏳ Đợi round mới..."
                     end
                 end
                 
                 if not isRunning then
-                    statusLabel.Text = "⏸️ Trạng thái: Chờ bật..."
+                    statusLabel.Text = "⏸️ Chờ bật..."
                 end
             end)
         end
@@ -547,11 +547,10 @@ end
 
 -- ═══════════════════════════════════════════
 -- ROUND DETECTION
--- Tự động re-detect khi map thay đổi
 -- ═══════════════════════════════════════════
 local function WatchForNewMaps()
     Workspace.ChildAdded:Connect(function(child)
-        task.wait(0.5) -- đợi map load xong
+        task.wait(0.5)
         if child:IsA("Model") or child:IsA("Folder") then
             local cc = child:FindFirstChild("CoinContainer")
             if cc then
@@ -563,38 +562,35 @@ local function WatchForNewMaps()
 end
 
 -- ═══════════════════════════════════════════
--- INITIALIZATION
+-- INIT
 -- ═══════════════════════════════════════════
 local function Init()
     print("══════════════════════════════════════════")
-    print("  MM2 Auto Farm Coin - v2.0 Loaded!")
-    print("  Cấu trúc: Workspace → Map → CoinContainer")
+    print("  MM2 Auto Farm Coin v6.0")
+    print("  Phương pháp: Teleport cực nhanh")
+    print("  Dịch chuyển tức thời đến coin")
     print("══════════════════════════════════════════")
     
-    -- Đợi game load
     if not game:IsLoaded() then
         game.Loaded:Wait()
     end
     task.wait(2)
     
-    -- Đợi character
     if not LocalPlayer.Character then
         LocalPlayer.CharacterAdded:Wait()
     end
     task.wait(1)
     
-    -- Khởi tạo
     SetupAntiAFK()
     WatchForNewMaps()
     CreateUI()
     
-    -- Thông báo map hiện tại nếu có
     local mapModel = FindCurrentMap()
     if mapModel then
         currentMapName = mapModel.Name
-        Notify("✅ Loaded", "Map hiện tại: " .. mapModel.Name .. "\nBấm nút để farm!")
+        Notify("✅ Loaded", "Map: " .. mapModel.Name .. "\nBấm nút để farm!")
     else
-        Notify("✅ Loaded", "Đang đợi round...\nBấm nút để farm khi vào round!")
+        Notify("✅ Loaded", "Đang đợi round...")
     end
 end
 
