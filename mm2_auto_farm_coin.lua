@@ -22,7 +22,7 @@
 local Config = {
     -- Farm
     FarmEnabled       = false,        -- Bắt đầu tắt, bấm nút UI để bật
-    FarmDelay         = 2,         -- Delay giữa mỗi lần teleport coin (giây)
+    FarmDelay         = 1.6,         -- Delay giữa mỗi lần teleport coin (giây)
     ReScanDelay       = 1,            -- Delay khi không tìm thấy coin (chờ spawn)
     TeleportYOffset   = 2,            -- Offset Y khi teleport (tránh kẹt dưới đất)
     
